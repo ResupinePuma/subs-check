@@ -5,6 +5,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 
 	"github.com/beck-8/subs-check/check"
 	"github.com/beck-8/subs-check/config"
@@ -123,7 +124,7 @@ func (cs *ConfigSaver) saveCategory(category ProxyCategory) error {
 		}
 		// 只在 all.yaml 和 local时，更新substore
 		if config.GlobalConfig.SaveMethod == "local" && config.GlobalConfig.SubStorePort != "" {
-			utils.UpdateSubStore(yamlData)
+			utils.UpdateSubStore(yamlData, buildRegionalProxyMap(cs.results))
 		}
 		return nil
 	}
@@ -166,6 +167,18 @@ func (cs *ConfigSaver) saveCategory(category ProxyCategory) error {
 	}
 
 	return nil
+}
+
+func buildRegionalProxyMap(results []check.Result) map[string][]map[string]any {
+	regional := make(map[string][]map[string]any)
+	for _, result := range results {
+		region := strings.ToUpper(strings.TrimSpace(result.Country))
+		if region == "" || result.Proxy == nil {
+			continue
+		}
+		regional[region] = append(regional[region], result.Proxy)
+	}
+	return regional
 }
 
 // chooseSaveMethod 根据配置选择保存方法

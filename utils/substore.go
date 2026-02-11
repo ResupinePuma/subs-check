@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -64,7 +65,7 @@ var mihomoOverwriteUrl string
 // 基础URL配置
 var BaseURL string
 
-func UpdateSubStore(yamlData []byte) {
+func UpdateSubStore(yamlData []byte, regionalProxies map[string][]map[string]any) {
 	// 调试的时候等一等node启动
 	if os.Getenv("SUB_CHECK_SKIP") != "" && config.GlobalConfig.SubStorePort != "" {
 		time.Sleep(time.Second * 1)
@@ -100,6 +101,10 @@ func UpdateSubStore(yamlData []byte) {
 		slog.Error(fmt.Sprintf("更新sub配置文件失败: %v", err))
 		return
 	}
+	if err := updateRegionalSubs(regionalProxies); err != nil {
+		slog.Error(fmt.Sprintf("更新地区订阅失败: %v", err))
+		return
+	}
 	if config.GlobalConfig.MihomoOverwriteUrl != mihomoOverwriteUrl {
 		if err := updatefile(); err != nil {
 			slog.Error(fmt.Sprintf("更新mihomo配置文件失败: %v", err))
@@ -110,6 +115,211 @@ func UpdateSubStore(yamlData []byte) {
 	}
 	slog.Info("substore更新完成")
 }
+
+func updateRegionalSubs(regionalProxies map[string][]map[string]any) error {
+	regionalContents := make(map[string]string)
+	for region, proxies := range regionalProxies {
+		if len(proxies) == 0 {
+			continue
+		}
+		body := map[string]any{
+			"proxies": proxies,
+		}
+		jsonBody, err := json.Marshal(body)
+		if err != nil {
+			slog.Warn(fmt.Sprintf("序列化地区订阅失败: region=%s err=%v", region, err))
+			continue
+		}
+		regionalContents[region] = string(jsonBody)
+	}
+	existingSubs, err := listSubNames()
+	if err != nil {
+		return fmt.Errorf("获取现有订阅列表失败: %w", err)
+	}
+
+	for region, content := range regionalContents {
+		if err := upsertSub(region, content, fmt.Sprintf("地区订阅(%s), subs-check自动维护", region)); err != nil {
+			return err
+		}
+	}
+
+	for name := range existingSubs {
+		if name == SubName {
+			continue
+		}
+		if _, ok := regionalContents[name]; ok {
+			continue
+		}
+		if err := deleteSub(name); err != nil {
+			return fmt.Errorf("删除空地区订阅失败(%s): %w", name, err)
+		}
+	}
+
+	if len(regionalContents) > 0 {
+		regions := make([]string, 0, len(regionalContents))
+		for region := range regionalContents {
+			regions = append(regions, region)
+		}
+		sort.Strings(regions)
+		slog.Info("地区订阅更新完成", "regions", strings.Join(regions, ","))
+	} else {
+		slog.Info("未找到可用地区节点，已清理地区订阅")
+	}
+
+	return nil
+}
+
+func listSubNames() (map[string]struct{}, error) {
+	resp, err := http.Get(fmt.Sprintf("%s/api/subs", BaseURL))
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("查询订阅列表失败, 错误码:%d, 响应:%s", resp.StatusCode, body)
+	}
+
+	var result struct {
+		Data []struct {
+			Name string `json:"name"`
+		} `json:"data"`
+		Status string `json:"status"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, err
+	}
+	if result.Status != "success" {
+		return nil, fmt.Errorf("订阅列表返回状态异常: %s", result.Status)
+	}
+
+	names := make(map[string]struct{}, len(result.Data))
+	for _, item := range result.Data {
+		name := strings.ToUpper(strings.TrimSpace(item.Name))
+		if name == "" {
+			continue
+		}
+		names[name] = struct{}{}
+	}
+	return names, nil
+}
+
+func upsertSub(name, content, remark string) error {
+	if err := checkSubByName(name); err != nil {
+		if err := createSubByName(name, content, remark); err != nil {
+			return fmt.Errorf("创建地区订阅失败(%s): %w", name, err)
+		}
+		return nil
+	}
+	if err := updateSubByName(name, content, remark); err != nil {
+		return fmt.Errorf("更新地区订阅失败(%s): %w", name, err)
+	}
+	return nil
+}
+
+func checkSubByName(name string) error {
+	resp, err := http.Get(fmt.Sprintf("%s/api/sub/%s", BaseURL, name))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode == http.StatusNotFound {
+		return fmt.Errorf("sub not found")
+	}
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("查询订阅失败, 错误码:%d, 响应:%s", resp.StatusCode, body)
+	}
+	var fileResult fileResult
+	err = json.Unmarshal(body, &fileResult)
+	if err != nil {
+		return err
+	}
+	if fileResult.Status != "success" {
+		return fmt.Errorf("获取sub配置文件失败")
+	}
+	return nil
+}
+
+func createSubByName(name, content, remark string) error {
+	sub := sub{
+		Content: content,
+		Name:    name,
+		Remark:  remark,
+		Source:  "local",
+		Process: []map[string]any{{"type": "Quick Setting Operator"}},
+	}
+	jsonData, err := json.Marshal(sub)
+	if err != nil {
+		return err
+	}
+	resp, err := http.Post(fmt.Sprintf("%s/api/subs", BaseURL), "application/json", bytes.NewBuffer(jsonData))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("创建sub配置文件失败,错误码:%d, 响应:%s", resp.StatusCode, body)
+	}
+	return nil
+}
+
+func updateSubByName(name, content, remark string) error {
+	sub := sub{
+		Content: content,
+		Name:    name,
+		Remark:  remark,
+		Source:  "local",
+		Process: []map[string]any{{"type": "Quick Setting Operator"}},
+	}
+	jsonData, err := json.Marshal(sub)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequest(http.MethodPatch, fmt.Sprintf("%s/api/sub/%s", BaseURL, name), bytes.NewBuffer(jsonData))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("更新sub配置文件失败,错误码:%d, 响应:%s", resp.StatusCode, body)
+	}
+	return nil
+}
+
+func deleteSub(name string) error {
+	req, err := http.NewRequest(http.MethodDelete, fmt.Sprintf("%s/api/sub/%s", BaseURL, name), nil)
+	if err != nil {
+		return err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("删除sub配置文件失败,错误码:%d, 响应:%s", resp.StatusCode, body)
+	}
+	return nil
+}
+
 func checkSub() error {
 	resp, err := http.Get(fmt.Sprintf("%s/api/sub/%s", BaseURL, SubName))
 	if err != nil {
@@ -219,24 +429,24 @@ func createfile() error {
 		Process: []Operator{
 			{
 				Args: args{
-					Content: WarpUrl(config.GlobalConfig.MihomoOverwriteUrl),
+					Content: config.GlobalConfig.MihomoOverwriteUrl,
 					Mode:    "link",
 				},
 				Disabled: false,
-				Type:     "Script Operator",
+				Type:     "Mihomo 覆写",
 			},
 		},
 		Remark:     "subs-check专用,勿动",
-		Source:     "local",
+		Source:     "sub",
 		SourceName: "sub",
-		SourceType: "subscription",
-		Type:       "mihomoProfile",
+		SourceType: "sub",
+		Type:       "subscription",
 	}
 	json, err := json.Marshal(file)
 	if err != nil {
 		return err
 	}
-	resp, err := http.Post(fmt.Sprintf("%s/api/files", BaseURL), "application/json", bytes.NewBuffer(json))
+	resp, err := http.Post(fmt.Sprintf("%s/api/wholeFiles", BaseURL), "application/json", bytes.NewBuffer(json))
 	if err != nil {
 		return err
 	}
@@ -253,25 +463,25 @@ func updatefile() error {
 		Process: []Operator{
 			{
 				Args: args{
-					Content: WarpUrl(config.GlobalConfig.MihomoOverwriteUrl),
+					Content: config.GlobalConfig.MihomoOverwriteUrl,
 					Mode:    "link",
 				},
 				Disabled: false,
-				Type:     "Script Operator",
+				Type:     "Mihomo 覆写",
 			},
 		},
 		Remark:     "subs-check专用,勿动",
-		Source:     "local",
+		Source:     "sub",
 		SourceName: "sub",
-		SourceType: "subscription",
-		Type:       "mihomoProfile",
+		SourceType: "sub",
+		Type:       "subscription",
 	}
 	json, err := json.Marshal(file)
 	if err != nil {
 		return err
 	}
 	req, err := http.NewRequest(http.MethodPatch,
-		fmt.Sprintf("%s/api/file/%s", BaseURL, MihomoName),
+		fmt.Sprintf("%s/api/wholeFile/%s", BaseURL, MihomoName),
 		bytes.NewBuffer(json))
 	if err != nil {
 		return err
@@ -288,41 +498,26 @@ func updatefile() error {
 	return nil
 }
 
-// 如果用户监听了局域网IP，后续会请求失败
 func formatPort(port string) string {
+	// 先去掉空格
+	port = strings.TrimSpace(port)
+
+	// 去掉可能存在的协议前缀
+	port = strings.TrimPrefix(port, "http://")
+	port = strings.TrimPrefix(port, "https://")
+
+	// 去掉主机地址部分，只保留端口
 	if strings.Contains(port, ":") {
 		parts := strings.Split(port, ":")
-		return ":" + parts[len(parts)-1]
+		if len(parts) > 1 {
+			port = parts[len(parts)-1]
+		}
 	}
-	return ":" + port
-}
 
-func WarpUrl(url string) string {
-	url = formatTimePlaceholders(url, time.Now())
-
-	// 如果url中以https://raw.githubusercontent.com开头，那么就使用github代理
-	if strings.HasPrefix(url, "https://raw.githubusercontent.com") {
-		return config.GlobalConfig.GithubProxy + url
+	// 确保有冒号前缀
+	if !strings.HasPrefix(port, ":") {
+		port = ":" + port
 	}
-	return url
-}
 
-// 动态时间占位符
-// 支持在链接中使用时间占位符，会自动替换成当前日期/时间:
-// - `{Y}` - 四位年份 (2023)
-// - `{m}` - 两位月份 (01-12)
-// - `{d}` - 两位日期 (01-31)
-// - `{Ymd}` - 组合日期 (20230131)
-// - `{Y_m_d}` - 下划线分隔 (2023_01_31)
-// - `{Y-m-d}` - 横线分隔 (2023-01-31)
-func formatTimePlaceholders(url string, t time.Time) string {
-	replacer := strings.NewReplacer(
-		"{Y}", t.Format("2006"),
-		"{m}", t.Format("01"),
-		"{d}", t.Format("02"),
-		"{Ymd}", t.Format("20060102"),
-		"{Y_m_d}", t.Format("2006_01_02"),
-		"{Y-m-d}", t.Format("2006-01-02"),
-	)
-	return replacer.Replace(url)
+	return port
 }
