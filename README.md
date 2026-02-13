@@ -228,6 +228,11 @@ http://127.0.0.1:8299/download/sub?target=Clash
 # V2Ray
 http://127.0.0.1:8299/download/sub?target=V2Ray
 
+# 按地区订阅（示例：RU）
+# 地区订阅由 subs-check 自动生成（例如 RU、US、SG），只保留该地区节点
+# 如果某地区没有可用节点，对应订阅会自动删除
+http://127.0.0.1:8299/download/RU?target=V2Ray
+
 # ShadowRocket
 http://127.0.0.1:8299/download/sub?target=ShadowRocket
 
